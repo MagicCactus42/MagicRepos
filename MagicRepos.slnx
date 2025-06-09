@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MagicRepos.Cli/MagicRepos.Cli.csproj" />
+    <Project Path="src/MagicRepos.Core/MagicRepos.Core.csproj" />
+    <Project Path="src/MagicRepos.Protocol/MagicRepos.Protocol.csproj" />
+    <Project Path="src/MagicRepos.Server/MagicRepos.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MagicRepos.Core.Tests/MagicRepos.Core.Tests.csproj" />
+    <Project Path="tests/MagicRepos.Protocol.Tests/MagicRepos.Protocol.Tests.csproj" />
+  </Folder>
+</Solution>
