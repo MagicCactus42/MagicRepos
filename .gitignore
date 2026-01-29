@@ -1,0 +1,28 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+publish/
+
+# .NET
+*.exe
+*.dll
+*.pdb
+*.nupkg
+*.user
+*.suo
+
+# IDE
+.vs/
+.idea/
+*.sln.DotSettings.user
+
+# MagicRepos local repo
+.magicrepos/
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
