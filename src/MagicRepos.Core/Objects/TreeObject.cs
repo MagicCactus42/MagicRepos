@@ -13,6 +13,15 @@ public sealed class TreeObject
 
         // Sort entries by name.
         var sorted = entries.OrderBy(e => e.Name, StringComparer.Ordinal).ToList();
+
+        // Reject duplicate names: a tree with two entries of the same name is ambiguous
+        // (e.g. a file and a directory both called "a") and would checkout inconsistently.
+        for (int i = 1; i < sorted.Count; i++)
+        {
+            if (string.Equals(sorted[i].Name, sorted[i - 1].Name, StringComparison.Ordinal))
+                throw new ArgumentException($"Duplicate tree entry name: '{sorted[i].Name}'.", nameof(entries));
+        }
+
         Entries = sorted.AsReadOnly();
         Id = ComputeId(sorted);
     }

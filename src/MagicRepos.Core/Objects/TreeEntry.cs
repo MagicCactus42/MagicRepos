@@ -7,7 +7,7 @@ namespace MagicRepos.Core.Objects;
 public enum FileMode
 {
     Regular = 0b_001_000_000_110_100_100,    // 0100644
-    Executable = 0b_001_000_000_110_101_101, // 0100755
+    Executable = 0b_001_000_000_111_101_101, // 0100755
     Directory = 0b_000_100_000_000_000_000,  // 0040000
     Symlink = 0b_001_010_000_000_000_000     // 0120000
 }
@@ -49,6 +49,15 @@ public sealed class TreeEntry : IComparable<TreeEntry>
     public TreeEntry(FileMode mode, string name, ObjectId id)
     {
         ArgumentNullException.ThrowIfNull(name);
+
+        // A tree entry name is a single path component. Names that are empty, contain a
+        // path separator or NUL, or are "." / ".." would corrupt the serialized tree
+        // format (which is "{mode} {name}\0{hash}") or the checkout path resolution.
+        if (name.Length == 0 || name is "." or ".."
+            || name.Contains('\0') || name.Contains('/') || name.Contains('\\'))
+        {
+            throw new ArgumentException($"Invalid tree entry name: '{name}'.", nameof(name));
+        }
 
         Mode = mode;
         Name = name;

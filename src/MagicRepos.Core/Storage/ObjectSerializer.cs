@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using MagicRepos.Core.Objects;
@@ -11,6 +12,13 @@ namespace MagicRepos.Core.Storage;
 /// </summary>
 public static class ObjectSerializer
 {
+    /// <summary>
+    /// Upper bound on the uncompressed size of a single object (512 MiB). Decompressing
+    /// beyond this is treated as a malformed/hostile object (a "zip bomb") and rejected,
+    /// so a small stored object cannot force an unbounded allocation when read back.
+    /// </summary>
+    private const long MaxDecompressedSize = 512L * 1024 * 1024;
+
     /// <summary>
     /// Creates header+content, computes SHA-256 over the uncompressed data,
     /// and returns the object ID along with the deflate-compressed bytes.
@@ -50,7 +58,13 @@ public static class ObjectSerializer
         string sizeString = header[(spaceIndex + 1)..];
 
         ObjectType objectType = ObjectTypeExtensions.ParseObjectType(typeString);
-        int contentLength = int.Parse(sizeString);
+        if (!int.TryParse(sizeString, NumberStyles.None, CultureInfo.InvariantCulture, out int contentLength))
+            throw new InvalidDataException($"Object header has an invalid content length: '{sizeString}'.");
+
+        int available = raw.Length - (nullIndex + 1);
+        if (contentLength != available)
+            throw new InvalidDataException(
+                $"Object header declares {contentLength} content bytes but {available} are present.");
 
         byte[] content = new byte[contentLength];
         Buffer.BlockCopy(raw, nullIndex + 1, content, 0, contentLength);
@@ -67,6 +81,30 @@ public static class ObjectSerializer
 
         byte[] raw = BuildRawBytes(type, content);
         return ObjectId.Hash(raw);
+    }
+
+    /// <summary>
+    /// Verifies that <paramref name="compressedData"/> decompresses to a well-formed object
+    /// whose SHA-256 equals <paramref name="expectedId"/>. Returns <see langword="false"/>
+    /// for malformed or tampered data instead of throwing, so it is safe to call on
+    /// untrusted network input (e.g. objects received during a push).
+    /// </summary>
+    public static bool TryVerify(byte[] compressedData, ObjectId expectedId)
+    {
+        ArgumentNullException.ThrowIfNull(compressedData);
+
+        byte[] raw;
+        try
+        {
+            raw = Decompress(compressedData);
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+
+        // The stored id is the hash of the exact uncompressed header+content bytes.
+        return ObjectId.Hash(raw) == expectedId;
     }
 
     /// <summary>
@@ -102,7 +140,18 @@ public static class ObjectSerializer
         using var input = new MemoryStream(compressedData);
         using var deflate = new DeflateStream(input, CompressionMode.Decompress);
         using var output = new MemoryStream();
-        deflate.CopyTo(output);
+
+        byte[] buffer = new byte[81920];
+        int read;
+        while ((read = deflate.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            if (output.Length + read > MaxDecompressedSize)
+                throw new InvalidDataException(
+                    $"Object exceeds the maximum decompressed size of {MaxDecompressedSize} bytes.");
+
+            output.Write(buffer, 0, read);
+        }
+
         return output.ToArray();
     }
 }

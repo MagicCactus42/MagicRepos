@@ -9,16 +9,23 @@ public readonly struct ObjectId : IEquatable<ObjectId>
     public const int ByteLength = 32;
     public const int HexLength = 64;
 
+    private static readonly byte[] ZeroBytes = new byte[ByteLength];
+
     private readonly byte[] _bytes;
 
-    public ReadOnlySpan<byte> Bytes => _bytes;
+    // A default(ObjectId) has a null backing array; treat it as the all-zero hash so that
+    // Bytes/ToHexString/GetHashCode/Equals never throw and behave consistently.
+    private byte[] SafeBytes => _bytes ?? ZeroBytes;
+
+    public ReadOnlySpan<byte> Bytes => SafeBytes;
 
     public ObjectId(byte[] bytes)
     {
         if (bytes is null || bytes.Length != ByteLength)
             throw new ArgumentException($"SHA-256 hash must be {ByteLength} bytes.", nameof(bytes));
 
-        _bytes = bytes;
+        // Defensive copy so later mutation of the caller's array cannot change this id.
+        _bytes = (byte[])bytes.Clone();
     }
 
     public ObjectId(ReadOnlySpan<byte> bytes) : this(bytes.ToArray())
@@ -29,17 +36,46 @@ public readonly struct ObjectId : IEquatable<ObjectId>
     {
         ArgumentNullException.ThrowIfNull(hex);
 
-        if (hex.Length != HexLength)
-            throw new ArgumentException($"Hex string must be {HexLength} characters.", nameof(hex));
+        if (!TryParse(hex, out ObjectId id))
+            throw new ArgumentException($"Invalid object id: must be {HexLength} hexadecimal characters.", nameof(hex));
+
+        return id;
+    }
+
+    /// <summary>
+    /// Attempts to parse a 64-character lowercase/uppercase hex string into an <see cref="ObjectId"/>.
+    /// Returns <see langword="false"/> for null, wrong-length, or non-hex input instead of throwing,
+    /// so it is safe to call on untrusted network input.
+    /// </summary>
+    public static bool TryParse(string? hex, out ObjectId id)
+    {
+        id = default;
+
+        if (hex is null || hex.Length != HexLength)
+            return false;
 
         var bytes = new byte[ByteLength];
         for (var i = 0; i < ByteLength; i++)
         {
-            bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            int hi = FromHexDigit(hex[i * 2]);
+            int lo = FromHexDigit(hex[i * 2 + 1]);
+            if (hi < 0 || lo < 0)
+                return false;
+
+            bytes[i] = (byte)((hi << 4) | lo);
         }
 
-        return new ObjectId(bytes);
+        id = new ObjectId(bytes);
+        return true;
     }
+
+    private static int FromHexDigit(char c) => c switch
+    {
+        >= '0' and <= '9' => c - '0',
+        >= 'a' and <= 'f' => c - 'a' + 10,
+        >= 'A' and <= 'F' => c - 'A' + 10,
+        _ => -1
+    };
 
     public static ObjectId Hash(ReadOnlySpan<byte> data)
     {
@@ -47,16 +83,9 @@ public readonly struct ObjectId : IEquatable<ObjectId>
         return new ObjectId(hash);
     }
 
-    public static ObjectId Hash(Stream stream)
-    {
-        var hash = new byte[ByteLength];
-        SHA256.HashData(stream, hash);
-        return new ObjectId(hash);
-    }
-
     public string ToHexString()
     {
-        return Convert.ToHexStringLower(_bytes);
+        return Convert.ToHexStringLower(SafeBytes);
     }
 
     /// <summary>First 2 hex characters, used as directory prefix in the object store.</summary>
@@ -67,7 +96,7 @@ public readonly struct ObjectId : IEquatable<ObjectId>
 
     public bool Equals(ObjectId other)
     {
-        return _bytes.AsSpan().SequenceEqual(other._bytes);
+        return SafeBytes.AsSpan().SequenceEqual(other.SafeBytes);
     }
 
     public override bool Equals(object? obj)
@@ -78,7 +107,7 @@ public readonly struct ObjectId : IEquatable<ObjectId>
     public override int GetHashCode()
     {
         // Use the first 4 bytes as a hash code for performance.
-        return BitConverter.ToInt32(_bytes, 0);
+        return BitConverter.ToInt32(SafeBytes, 0);
     }
 
     public override string ToString() => ToHexString();
