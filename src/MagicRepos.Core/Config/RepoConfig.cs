@@ -1,3 +1,6 @@
+using System.Text;
+using MagicRepos.Core.Storage;
+
 namespace MagicRepos.Core.Config;
 
 /// <summary>
@@ -88,9 +91,7 @@ public class RepoConfig
     /// </summary>
     public void Save()
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-
-        using var writer = new StreamWriter(_configPath, append: false);
+        var sb = new StringBuilder();
 
         bool first = true;
         foreach (string sectionHeader in _sectionOrder)
@@ -99,15 +100,19 @@ public class RepoConfig
                 continue;
 
             if (!first)
-                writer.WriteLine();
+                sb.Append('\n');
             first = false;
 
-            writer.WriteLine($"[{sectionHeader}]");
+            sb.Append('[').Append(sectionHeader).Append("]\n");
             foreach ((string key, string value) in kvps)
             {
-                writer.WriteLine($"    {key} = {value}");
+                sb.Append("    ").Append(key).Append(" = ").Append(value).Append('\n');
             }
         }
+
+        // Atomic write so a crash mid-save cannot truncate the config (losing user
+        // identity and remotes).
+        AtomicFile.WriteAllText(_configPath, sb.ToString());
     }
 
     // ──────────────────────────── Get / Set (simple section) ────────────────────────────
@@ -146,6 +151,8 @@ public class RepoConfig
     /// </summary>
     public void Set(string section, string key, string value)
     {
+        ValidateKey(key);
+        ValidateValue(value);
         EnsureSection(section);
         _sections[section][key] = value;
     }
@@ -155,6 +162,8 @@ public class RepoConfig
     /// </summary>
     public void Set(string section, string subsection, string key, string value)
     {
+        ValidateKey(key);
+        ValidateValue(value);
         string header = BuildSectionHeader(section, subsection);
         EnsureSection(header);
         _sections[header][key] = value;
@@ -221,6 +230,27 @@ public class RepoConfig
     /// </summary>
     private static string BuildSectionHeader(string section, string subsection)
     {
+        if (subsection.Contains('"') || subsection.Contains('\n') || subsection.Contains('\r'))
+            throw new ArgumentException("Subsection name may not contain '\"', CR, or LF.", nameof(subsection));
+
         return $"{section} \"{subsection}\"";
+    }
+
+    // Keys and values are written verbatim to the INI file, so anything containing a
+    // newline (or, for keys, an '=') could inject fake sections/keys on the next Load.
+    private static void ValidateKey(string key)
+    {
+        if (string.IsNullOrEmpty(key) || key.Contains('=') || key.Contains('\n')
+            || key.Contains('\r') || key.Contains('['))
+        {
+            throw new ArgumentException("Config key may not be empty or contain '=', '[', CR, or LF.", nameof(key));
+        }
+    }
+
+    private static void ValidateValue(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Contains('\n') || value.Contains('\r'))
+            throw new ArgumentException("Config value may not contain CR or LF.", nameof(value));
     }
 }

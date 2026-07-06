@@ -24,6 +24,8 @@ public sealed class ObjectStore
 
     /// <summary>
     /// Writes compressed object data to disk. If the object already exists, the write is skipped.
+    /// The write is atomic (temp file + rename), so a crash mid-write never leaves a
+    /// truncated object masquerading as a complete one.
     /// </summary>
     public void Write(ObjectId id, byte[] compressedData)
     {
@@ -34,11 +36,7 @@ public sealed class ObjectStore
         if (File.Exists(path))
             return;
 
-        string? directory = Path.GetDirectoryName(path);
-        if (directory is not null)
-            Directory.CreateDirectory(directory);
-
-        File.WriteAllBytes(path, compressedData);
+        AtomicFile.WriteAllBytes(path, compressedData);
     }
 
     /// <summary>

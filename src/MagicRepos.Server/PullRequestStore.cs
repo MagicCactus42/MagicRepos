@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using MagicRepos.Core.Storage;
 
 namespace MagicRepos.Server;
 
@@ -53,7 +54,9 @@ public class PullRequestStore
     }
 
     /// <summary>
-    /// Creates a new pull request with an atomically assigned number.
+    /// Creates a new pull request. The number is allocated by claiming the next free
+    /// <c>{n}.json</c> file with exclusive-create semantics, so two concurrent creators
+    /// never collide on the same number.
     /// </summary>
     public PullRequest Create(string title, string description, string author,
         string sourceBranch, string targetBranch)
@@ -62,7 +65,6 @@ public class PullRequestStore
 
         var pr = new PullRequest
         {
-            Number = GetNextNumber(),
             Title = title,
             Description = description,
             Author = author,
@@ -72,9 +74,25 @@ public class PullRequestStore
             CreatedAt = DateTime.UtcNow
         };
 
-        string json = JsonSerializer.Serialize(pr, JsonOptions);
-        File.WriteAllText(GetFilePath(pr.Number), json);
-        return pr;
+        int candidate = GetNextNumber();
+        while (true)
+        {
+            try
+            {
+                // FileMode.CreateNew fails if the file already exists, so whichever
+                // creator wins the race for this number keeps it and the other retries.
+                using var stream = new FileStream(GetFilePath(candidate), FileMode.CreateNew,
+                    FileAccess.Write, FileShare.None);
+                pr.Number = candidate;
+                JsonSerializer.Serialize(stream, pr, JsonOptions);
+                stream.Flush(flushToDisk: true);
+                return pr;
+            }
+            catch (IOException) when (File.Exists(GetFilePath(candidate)))
+            {
+                candidate++;
+            }
+        }
     }
 
     /// <summary>
@@ -119,9 +137,8 @@ public class PullRequestStore
     /// </summary>
     public void Update(PullRequest pr)
     {
-        Directory.CreateDirectory(_prDir);
         string json = JsonSerializer.Serialize(pr, JsonOptions);
-        File.WriteAllText(GetFilePath(pr.Number), json);
+        AtomicFile.WriteAllText(GetFilePath(pr.Number), json);
     }
 
     /// <summary>

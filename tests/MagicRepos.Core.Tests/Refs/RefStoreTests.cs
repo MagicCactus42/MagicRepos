@@ -42,6 +42,22 @@ public class RefStoreTests : IDisposable
     }
 
     [Fact]
+    public void ListBranches_excludes_leftover_atomic_temp_files()
+    {
+        // Arrange: a crash between temp-file creation and rename leaves a .tmp_ file.
+        _refs.CreateBranch("main", MakeId("tip"));
+        File.WriteAllText(
+            Path.Combine(_tempDir, "refs", "heads", MagicRepos.Core.Storage.AtomicFile.TempFilePrefix + "abc123"),
+            MakeId("tip").ToHexString());
+
+        // Act
+        IReadOnlyList<string> branches = _refs.ListBranches();
+
+        // Assert
+        branches.Should().ContainSingle().Which.Should().Be("main");
+    }
+
+    [Fact]
     public void WriteHead_and_ReadHead_roundtrip_detached_hash()
     {
         // Arrange

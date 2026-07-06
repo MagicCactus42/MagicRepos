@@ -1,4 +1,5 @@
 using System.Text.Json;
+using MagicRepos.Core.Storage;
 
 namespace MagicRepos.Server;
 
@@ -45,8 +46,10 @@ public class AccessControl
         if (string.IsNullOrEmpty(authenticatedUser))
             return false;
 
-        // Owner always has write access
-        if (string.Equals(authenticatedUser, repoOwner, StringComparison.OrdinalIgnoreCase))
+        // Owner always has write access. Identity comparisons are case-sensitive because
+        // repositories live at case-sensitive filesystem paths ({baseDir}/{owner}/...);
+        // a case-insensitive match here would let "Alice" write to "alice"'s namespace.
+        if (string.Equals(authenticatedUser, repoOwner, StringComparison.Ordinal))
             return true;
 
         // Check collaborator list
@@ -55,7 +58,7 @@ public class AccessControl
 
         if (permissions.Repositories.TryGetValue(repoKey, out var repoPerms))
         {
-            return repoPerms.Collaborators.Contains(authenticatedUser, StringComparer.OrdinalIgnoreCase);
+            return repoPerms.Collaborators.Contains(authenticatedUser, StringComparer.Ordinal);
         }
 
         return false;
@@ -75,7 +78,7 @@ public class AccessControl
             permissions.Repositories[repoKey] = repoPerms;
         }
 
-        if (!repoPerms.Collaborators.Contains(username, StringComparer.OrdinalIgnoreCase))
+        if (!repoPerms.Collaborators.Contains(username, StringComparer.Ordinal))
         {
             repoPerms.Collaborators.Add(username);
         }
@@ -96,7 +99,7 @@ public class AccessControl
             return false;
 
         int index = repoPerms.Collaborators.FindIndex(
-            c => string.Equals(c, username, StringComparison.OrdinalIgnoreCase));
+            c => string.Equals(c, username, StringComparison.Ordinal));
 
         if (index < 0)
             return false;
@@ -136,12 +139,8 @@ public class AccessControl
 
     private void SavePermissions(PermissionsFile permissions)
     {
-        string? dir = Path.GetDirectoryName(_permissionsPath);
-        if (dir is not null)
-            Directory.CreateDirectory(dir);
-
         string json = JsonSerializer.Serialize(permissions, JsonOptions);
-        File.WriteAllText(_permissionsPath, json);
+        AtomicFile.WriteAllText(_permissionsPath, json);
     }
 }
 

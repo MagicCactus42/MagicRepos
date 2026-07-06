@@ -12,7 +12,7 @@ public sealed class IndexEntry
 {
     public long ModifiedTimeSeconds { get; set; }
     public int ModifiedTimeNanoseconds { get; set; }
-    public int FileSize { get; set; }
+    public long FileSize { get; set; }
     public ObjectId ObjectId { get; set; }
     public ushort Flags { get; set; }
     public string Path { get; set; } = string.Empty;
@@ -58,6 +58,14 @@ public sealed class IndexFile
     public void AddOrUpdate(IndexEntry entry)
     {
         ArgumentNullException.ThrowIfNull(entry);
+
+        // Resolve file/directory conflicts: a file and a directory cannot share a name.
+        // Adding "a/b" must evict a stale file entry "a"; adding file "a" must evict any
+        // entries under "a/". Otherwise BuildTree would emit an ambiguous tree.
+        _entries.RemoveAll(e =>
+            !string.Equals(e.Path, entry.Path, StringComparison.Ordinal)
+            && (e.Path.StartsWith(entry.Path + "/", StringComparison.Ordinal)
+                || entry.Path.StartsWith(e.Path + "/", StringComparison.Ordinal)));
 
         int index = _entries.FindIndex(e =>
             string.Equals(e.Path, entry.Path, StringComparison.Ordinal));
@@ -108,8 +116,9 @@ public sealed class IndexFile
             // mtime_ns (big-endian uint32)
             WriteUInt32(ms, (uint)entry.ModifiedTimeNanoseconds);
 
-            // fileSize (big-endian uint32)
-            WriteUInt32(ms, (uint)entry.FileSize);
+            // fileSize (big-endian uint32; clamped so a huge file stores a saturated,
+            // non-negative value rather than wrapping to a bogus size)
+            WriteUInt32(ms, (uint)Math.Clamp(entry.FileSize, 0, uint.MaxValue));
 
             // objectId (32 bytes)
             ms.Write(entry.ObjectId.Bytes);
@@ -133,14 +142,12 @@ public sealed class IndexFile
         byte[] dataBytes = ms.ToArray();
         byte[] checksum = SHA256.HashData(dataBytes);
 
-        // Write data + checksum to file
-        string? directory = System.IO.Path.GetDirectoryName(filePath);
-        if (directory is not null)
-            Directory.CreateDirectory(directory);
-
-        using var fs = new FileStream(filePath, System.IO.FileMode.Create, FileAccess.Write);
-        fs.Write(dataBytes, 0, dataBytes.Length);
-        fs.Write(checksum, 0, checksum.Length);
+        // Write data + checksum atomically so a crash mid-write cannot leave a
+        // checksum-invalid index that bricks every subsequent command.
+        byte[] fileBytes = new byte[dataBytes.Length + checksum.Length];
+        Buffer.BlockCopy(dataBytes, 0, fileBytes, 0, dataBytes.Length);
+        Buffer.BlockCopy(checksum, 0, fileBytes, dataBytes.Length, checksum.Length);
+        AtomicFile.WriteAllBytes(filePath, fileBytes);
     }
 
     /// <summary>
@@ -220,7 +227,7 @@ public sealed class IndexFile
             {
                 ModifiedTimeSeconds = (long)mtimeS,
                 ModifiedTimeNanoseconds = (int)mtimeNs,
-                FileSize = (int)fileSize,
+                FileSize = fileSize,
                 ObjectId = new ObjectId(objectIdBytes),
                 Flags = flags,
                 Path = path

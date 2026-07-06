@@ -1,6 +1,7 @@
 namespace MagicRepos.Core.Refs;
 
 using MagicRepos.Core.Objects;
+using MagicRepos.Core.Storage;
 
 /// <summary>
 /// Manages references (branches, HEAD, tags) stored as files under <c>.magicrepos/refs/</c>.
@@ -38,8 +39,7 @@ public class RefStore
     /// </summary>
     public void WriteHead(string content)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(HeadPath)!);
-        File.WriteAllText(HeadPath, content + "\n");
+        AtomicFile.WriteAllText(HeadPath, content + "\n");
     }
 
     /// <summary>
@@ -103,8 +103,7 @@ public class RefStore
     public void CreateBranch(string name, ObjectId commitId)
     {
         string branchPath = Path.Combine(HeadsDir, name);
-        Directory.CreateDirectory(Path.GetDirectoryName(branchPath)!);
-        File.WriteAllText(branchPath, commitId.ToString() + "\n");
+        AtomicFile.WriteAllText(branchPath, commitId.ToString() + "\n");
     }
 
     /// <summary>
@@ -140,6 +139,7 @@ public class RefStore
             return Array.Empty<string>();
 
         return Directory.GetFiles(HeadsDir, "*", SearchOption.AllDirectories)
+            .Where(f => !Path.GetFileName(f).StartsWith(AtomicFile.TempFilePrefix, StringComparison.Ordinal))
             .Select(f => Path.GetRelativePath(HeadsDir, f).Replace(Path.DirectorySeparatorChar, '/'))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToList();
@@ -153,8 +153,7 @@ public class RefStore
     public void WriteRef(string refPath, ObjectId id)
     {
         string fullPath = Path.Combine(RefsDir, refPath.Replace('/', Path.DirectorySeparatorChar));
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        File.WriteAllText(fullPath, id.ToString() + "\n");
+        AtomicFile.WriteAllText(fullPath, id.ToString() + "\n");
     }
 
     /// <summary>
@@ -188,8 +187,8 @@ public class RefStore
         if (string.IsNullOrWhiteSpace(refOrHash))
             return null;
 
-        // 1. HEAD
-        if (refOrHash.Equals("HEAD", StringComparison.OrdinalIgnoreCase))
+        // 1. HEAD (case-sensitive: a branch literally named "head" must stay reachable)
+        if (refOrHash.Equals("HEAD", StringComparison.Ordinal))
             return ResolveHead();
 
         // 2. Explicit full ref path (starts with "refs/")
