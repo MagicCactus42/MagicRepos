@@ -78,10 +78,8 @@ public class IgnoreRuleSet
 }
 
 internal record IgnoreRule(
-    string Pattern,
     bool IsNegated,
     bool IsDirectoryOnly,
-    bool IsAnchored,
     Regex CompiledRegex)
 {
     /// <summary>
@@ -123,7 +121,7 @@ internal record IgnoreRule(
 
         var regex = GlobToRegex(pattern, isAnchored);
 
-        return new IgnoreRule(pattern, isNegated, isDirectoryOnly, isAnchored, regex);
+        return new IgnoreRule(isNegated, isDirectoryOnly, regex);
     }
 
     /// <summary>
@@ -131,9 +129,25 @@ internal record IgnoreRule(
     /// </summary>
     public bool Matches(string relativePath, bool isDirectory)
     {
-        // If rule is directory-only but the path is not a directory, skip
-        if (IsDirectoryOnly && !isDirectory)
+        if (IsDirectoryOnly)
+        {
+            // A directory-only rule matches the directory itself only when the path is a
+            // directory, but it must also ignore files/dirs that live *inside* a matched
+            // directory. So a file is matched only when one of its ancestor directories
+            // matches (never when the file merely shares the directory's name).
+            if (isDirectory && CompiledRegex.IsMatch(relativePath))
+                return true;
+
+            int slash = relativePath.IndexOf('/');
+            while (slash >= 0)
+            {
+                if (CompiledRegex.IsMatch(relativePath[..slash]))
+                    return true;
+                slash = relativePath.IndexOf('/', slash + 1);
+            }
+
             return false;
+        }
 
         return CompiledRegex.IsMatch(relativePath);
     }
@@ -195,11 +209,20 @@ internal record IgnoreRule(
             }
             else if (c == '[')
             {
-                // Character class — pass through until ]
+                // Character class. gitignore uses a leading '!' for negation, whereas regex
+                // uses '^'; translate it so e.g. "[!0-9]" matches non-digits correctly.
                 var end = pattern.IndexOf(']', i + 1);
-                if (end >= 0)
+                if (end > i + 1)
                 {
-                    regexParts.Add(pattern[i..(end + 1)]);
+                    string body = pattern[(i + 1)..end];
+                    bool negated = body.StartsWith('!');
+                    if (negated)
+                        body = body[1..];
+
+                    // A backslash inside the class would otherwise start a regex escape.
+                    body = body.Replace("\\", "\\\\");
+
+                    regexParts.Add("[" + (negated ? "^" : "") + body + "]");
                     i = end + 1;
                 }
                 else
