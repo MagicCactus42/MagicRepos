@@ -247,6 +247,21 @@ public static class DiffEngine
             var hunkStart = Math.Max(0, start - contextLines);
             var hunkEnd = Math.Min(edits.Count - 1, end + contextLines);
 
+            // Count the old/new lines preceding this hunk, so a zero-count side can report
+            // the line number just before the change (unified-diff convention: e.g. a pure
+            // insertion at the top of an empty file is "@@ -0,0 +1,N @@").
+            var oldBefore = 0;
+            var newBefore = 0;
+            for (var j = 0; j < hunkStart; j++)
+            {
+                switch (edits[j].Type)
+                {
+                    case DiffEditType.Equal: oldBefore++; newBefore++; break;
+                    case DiffEditType.Delete: oldBefore++; break;
+                    case DiffEditType.Insert: newBefore++; break;
+                }
+            }
+
             var lines = new List<DiffLine>();
             var oldStart = int.MaxValue;
             var newStart = int.MaxValue;
@@ -299,15 +314,11 @@ public static class DiffEngine
                 }
             }
 
-            // Convert from 0-indexed to 1-indexed for hunk header
-            var hunkOldStart = oldCount > 0 ? oldStart + 1 : 0;
-            var hunkNewStart = newCount > 0 ? newStart + 1 : 0;
-
-            // If old or new side is empty but the other isn't, position after last context line
-            if (oldCount == 0 && newCount > 0)
-                hunkOldStart = newStart + 1;
-            if (newCount == 0 && oldCount > 0)
-                hunkNewStart = oldStart + 1;
+            // Convert from 0-indexed to 1-indexed for the hunk header. A side with zero
+            // lines reports the count of preceding lines on that side (0 at file start),
+            // matching the unified-diff / `git diff` convention.
+            var hunkOldStart = oldCount > 0 ? oldStart + 1 : oldBefore;
+            var hunkNewStart = newCount > 0 ? newStart + 1 : newBefore;
 
             hunks.Add(new DiffHunk(hunkOldStart, oldCount, hunkNewStart, newCount, lines));
         }
