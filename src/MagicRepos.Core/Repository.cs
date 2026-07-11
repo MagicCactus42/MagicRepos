@@ -140,7 +140,7 @@ public class Repository
         {
             ModifiedTimeSeconds = mtimeSeconds,
             ModifiedTimeNanoseconds = 0,
-            FileSize = (int)fileInfo.Length,
+            FileSize = fileInfo.Length,
             ObjectId = blobId,
             Flags = (ushort)Math.Min(normalizedPath.Length, 0xFFF),
             Path = normalizedPath
@@ -163,13 +163,9 @@ public class Repository
         IReadOnlyList<string> files = workingTree.GetFiles();
         IndexFile index = LoadIndex();
 
-        // Track which paths are still present in the working tree
-        var presentPaths = new HashSet<string>(StringComparer.Ordinal);
-
         foreach (string relativePath in files)
         {
             string normalizedPath = relativePath.Replace('\\', '/');
-            presentPaths.Add(normalizedPath);
 
             string fullPath = Path.Combine(WorkingDirectory,
                 normalizedPath.Replace('/', Path.DirectorySeparatorChar));
@@ -185,7 +181,7 @@ public class Repository
             {
                 ModifiedTimeSeconds = mtimeSeconds,
                 ModifiedTimeNanoseconds = 0,
-                FileSize = (int)fileInfo.Length,
+                FileSize = fileInfo.Length,
                 ObjectId = blobId,
                 Flags = (ushort)Math.Min(normalizedPath.Length, 0xFFF),
                 Path = normalizedPath
@@ -194,9 +190,12 @@ public class Repository
             index.AddOrUpdate(entry);
         }
 
-        // Remove entries for deleted files
+        // Remove entries only for files that are genuinely gone from disk. A tracked file
+        // that matches an ignore rule is absent from the (ignore-filtered) working set but
+        // still exists — it must NOT be treated as a deletion.
         var toRemove = index.Entries
-            .Where(e => !presentPaths.Contains(e.Path))
+            .Where(e => !File.Exists(Path.Combine(WorkingDirectory,
+                e.Path.Replace('/', Path.DirectorySeparatorChar))))
             .Select(e => e.Path)
             .ToList();
 
@@ -220,11 +219,22 @@ public class Repository
     public ObjectId CreateCommit(string message, Signature? author = null)
     {
         IndexFile index = LoadIndex();
-        if (index.Entries.Count == 0)
-            throw new InvalidOperationException("Nothing to commit: the index is empty.");
 
         // Build tree from index entries
         ObjectId treeId = BuildTree(index.Entries);
+
+        // Reject a no-op commit, but allow committing the deletion of the last file
+        // (an empty index whose empty tree differs from HEAD is a real change).
+        ObjectId? headTreeId = GetHeadTreeId();
+        if (headTreeId is null)
+        {
+            if (index.Entries.Count == 0)
+                throw new InvalidOperationException("Nothing to commit: the index is empty.");
+        }
+        else if (headTreeId.Value == treeId)
+        {
+            throw new InvalidOperationException("Nothing to commit: no changes staged.");
+        }
 
         // Determine author/committer
         Signature sig = author ?? GetDefaultSignature();
@@ -403,10 +413,14 @@ public class Repository
             }
         }
 
-        // Files in index but not in working tree -> unstaged deleted
+        // Files in index but not on disk -> unstaged deleted. Check the filesystem
+        // directly (not the ignore-filtered working set) so a tracked-but-ignored file
+        // that still exists is not misreported as deleted.
         foreach (IndexEntry entry in index.Entries)
         {
-            if (!workingFilesSet.Contains(entry.Path))
+            string fullPath = Path.Combine(WorkingDirectory,
+                entry.Path.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(fullPath))
             {
                 unstagedChanges.Add(new FileStatus(entry.Path, FileStatusType.Deleted));
             }
@@ -453,8 +467,6 @@ public class Repository
     public IReadOnlyList<DiffResult> DiffWorkingTree()
     {
         IndexFile index = LoadIndex();
-        IgnoreRuleSet ignoreRules = LoadIgnoreRules();
-        var workingTree = new WorkingTree(WorkingDirectory, ignoreRules);
         var results = new List<DiffResult>();
 
         foreach (IndexEntry entry in index.Entries)
@@ -607,6 +619,53 @@ public class Repository
         return Refs.ListBranches();
     }
 
+    /// <summary>
+    /// Returns <see langword="true"/> if <paramref name="ancestor"/> is reachable by
+    /// following commit parents from <paramref name="descendant"/> (i.e. advancing
+    /// <paramref name="ancestor"/> to <paramref name="descendant"/> is a fast-forward).
+    /// Both commits must be present in the local object store.
+    /// </summary>
+    public bool IsAncestor(ObjectId ancestor, ObjectId descendant)
+    {
+        var visited = new HashSet<ObjectId>();
+        var stack = new Stack<ObjectId>();
+        stack.Push(descendant);
+
+        while (stack.Count > 0)
+        {
+            ObjectId id = stack.Pop();
+            if (id == ancestor)
+                return true;
+
+            if (!visited.Add(id) || !ObjectStore.Exists(id))
+                continue;
+
+            CommitObject commit;
+            try
+            {
+                commit = ReadCommit(id);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException)
+            {
+                continue;
+            }
+
+            foreach (ObjectId parent in commit.Parents)
+                stack.Push(parent);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> if the working tree has no staged or unstaged changes.
+    /// </summary>
+    public bool IsWorkingTreeClean()
+    {
+        RepositoryStatus status = GetStatus();
+        return status.StagedChanges.Count == 0 && status.UnstagedChanges.Count == 0;
+    }
+
     // ══════════════════════════════════════════════════════════════
     //  Checkout
     // ══════════════════════════════════════════════════════════════
@@ -614,8 +673,13 @@ public class Repository
     /// <summary>
     /// Checks out a branch by resolving it to a commit, updating the working tree
     /// and index to match the commit's tree, and pointing HEAD at the branch.
+    /// <para>
+    /// Refuses (unless <paramref name="force"/> is set) if the checkout would discard
+    /// uncommitted changes to tracked files or overwrite untracked files that differ
+    /// from the target — matching Git's default safety behaviour.
+    /// </para>
     /// </summary>
-    public void CheckoutBranch(string branchName)
+    public void CheckoutBranch(string branchName, bool force = false)
     {
         ObjectId? commitId = Refs.ResolveBranch(branchName);
         if (commitId is null)
@@ -624,8 +688,21 @@ public class Repository
         CommitObject commit = ReadCommit(commitId.Value);
         List<(string Path, ObjectId Id)> treeEntries = ReadTreeRecursive(commit.TreeId);
 
-        // Clear existing tracked files from working tree
         IndexFile currentIndex = LoadIndex();
+
+        if (!force)
+        {
+            IReadOnlyList<string> conflicts = FindCheckoutConflicts(currentIndex, treeEntries);
+            if (conflicts.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "Your local changes to the following files would be overwritten by checkout: "
+                    + string.Join(", ", conflicts)
+                    + ". Commit your changes or use force to discard them.");
+            }
+        }
+
+        // Clear existing tracked files from working tree
         foreach (IndexEntry entry in currentIndex.Entries)
         {
             string fullPath = Path.Combine(WorkingDirectory,
@@ -659,7 +736,7 @@ public class Repository
             {
                 ModifiedTimeSeconds = mtimeSeconds,
                 ModifiedTimeNanoseconds = 0,
-                FileSize = (int)fileInfo.Length,
+                FileSize = fileInfo.Length,
                 ObjectId = blobId,
                 Flags = (ushort)Math.Min(path.Length, 0xFFF),
                 Path = path
@@ -670,6 +747,91 @@ public class Repository
 
         // Update HEAD to point to the branch
         Refs.WriteHead($"ref: refs/heads/{branchName}");
+    }
+
+    /// <summary>
+    /// Returns the paths that a checkout of <paramref name="targetEntries"/> would clobber:
+    /// tracked files with uncommitted modifications (staged or unstaged) that the target
+    /// changes or removes, and untracked working-tree files the target would overwrite
+    /// with different content.
+    /// </summary>
+    private IReadOnlyList<string> FindCheckoutConflicts(
+        IndexFile currentIndex, List<(string Path, ObjectId Id)> targetEntries)
+    {
+        var currentByPath = new Dictionary<string, ObjectId>(StringComparer.Ordinal);
+        foreach (IndexEntry e in currentIndex.Entries)
+            currentByPath[e.Path] = e.ObjectId;
+
+        var targetByPath = new Dictionary<string, ObjectId>(StringComparer.Ordinal);
+        foreach ((string path, ObjectId id) in targetEntries)
+            targetByPath[path] = id;
+
+        // The HEAD tree is the baseline for "uncommitted": index content that differs
+        // from HEAD is staged-but-uncommitted, even when the working file matches it.
+        var headByPath = new Dictionary<string, ObjectId>(StringComparer.Ordinal);
+        ObjectId? headTreeId = GetHeadTreeId();
+        if (headTreeId is not null)
+        {
+            foreach ((string path, ObjectId id) in ReadTreeRecursive(headTreeId.Value))
+                headByPath[path] = id;
+        }
+
+        var conflicts = new List<string>();
+
+        foreach (IndexEntry entry in currentIndex.Entries)
+        {
+            bool targetHas = targetByPath.TryGetValue(entry.Path, out ObjectId targetId);
+
+            // Staged content not in HEAD would be discarded when the index is rebuilt
+            // from the target — a conflict unless the target holds that exact content.
+            bool stagedChange = !headByPath.TryGetValue(entry.Path, out ObjectId headId)
+                || headId != entry.ObjectId;
+            if (stagedChange && (!targetHas || targetId != entry.ObjectId))
+            {
+                conflicts.Add(entry.Path);
+                continue;
+            }
+
+            // An unstaged modification is a conflict when the checkout would change the
+            // on-disk content. (If the on-disk content already equals the target, the
+            // switch is a no-op for that file and is safe.)
+            ObjectId? workingId = ComputeWorkingBlobId(entry.Path);
+            if (workingId is null)
+                continue; // deleted in the working tree; checkout restores it (Git-lenient)
+
+            if (workingId.Value == entry.ObjectId)
+                continue; // unmodified — safe to update
+
+            if (!targetHas || targetId != workingId.Value)
+                conflicts.Add(entry.Path);
+        }
+
+        // Untracked working files the checkout would overwrite with different content.
+        foreach ((string path, ObjectId id) in targetEntries)
+        {
+            if (currentByPath.ContainsKey(path))
+                continue; // tracked — handled above
+
+            ObjectId? workingId = ComputeWorkingBlobId(path);
+            if (workingId is not null && workingId.Value != id)
+                conflicts.Add(path);
+        }
+
+        return conflicts;
+    }
+
+    /// <summary>
+    /// Computes the blob id of the working-tree file at <paramref name="relativePath"/>,
+    /// or <see langword="null"/> if it does not exist.
+    /// </summary>
+    private ObjectId? ComputeWorkingBlobId(string relativePath)
+    {
+        string fullPath = Path.Combine(WorkingDirectory,
+            relativePath.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(fullPath))
+            return null;
+
+        return ObjectSerializer.ComputeId(ObjectType.Blob, File.ReadAllBytes(fullPath));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -691,6 +853,10 @@ public class Repository
             throw new InvalidOperationException($"Cannot resolve target '{target}' to a commit.");
 
         CommitObject commit = ReadCommit(commitId.Value);
+
+        // Snapshot the index BEFORE it is overwritten below, so a Hard reset knows which
+        // files were tracked pre-reset and can delete those the target no longer contains.
+        IndexFile preResetIndex = LoadIndex();
 
         // Move HEAD
         string? branchName = Refs.GetCurrentBranchName();
@@ -716,13 +882,13 @@ public class Repository
                 path.Replace('/', Path.DirectorySeparatorChar));
 
             long mtimeSeconds = 0;
-            int fileSize = 0;
+            long fileSize = 0;
 
             if (File.Exists(fullPath))
             {
                 var fileInfo = new FileInfo(fullPath);
                 mtimeSeconds = new DateTimeOffset(fileInfo.LastWriteTimeUtc).ToUnixTimeSeconds();
-                fileSize = (int)fileInfo.Length;
+                fileSize = fileInfo.Length;
             }
             else
             {
@@ -747,11 +913,11 @@ public class Repository
         if (mode != ResetMode.Hard)
             return;
 
-        // Reset working tree: remove tracked files, then write from tree
-        IndexFile oldIndex = LoadIndex();
-        // Use both old and new entries to determine which files to consider
+        // Reset working tree: remove tracked files, then write from tree.
+        // Consider both the pre-reset tracked paths and the target's paths so files that
+        // existed only before the reset are removed from the working tree.
         var allTrackedPaths = new HashSet<string>(StringComparer.Ordinal);
-        foreach (IndexEntry e in oldIndex.Entries)
+        foreach (IndexEntry e in preResetIndex.Entries)
             allTrackedPaths.Add(e.Path);
         foreach ((string path, _) in treeEntries)
             allTrackedPaths.Add(path);
@@ -793,7 +959,7 @@ public class Repository
             {
                 ModifiedTimeSeconds = mtimeSeconds,
                 ModifiedTimeNanoseconds = 0,
-                FileSize = (int)fileInfo.Length,
+                FileSize = fileInfo.Length,
                 ObjectId = blobId,
                 Flags = (ushort)Math.Min(path.Length, 0xFFF),
                 Path = path
@@ -883,18 +1049,6 @@ public class Repository
             throw new InvalidOperationException($"Object {id} is not a tree (found {type}).");
 
         return ParseTree(content);
-    }
-
-    /// <summary>
-    /// Reads and parses a blob object from the object store.
-    /// </summary>
-    public BlobObject ReadBlob(ObjectId id)
-    {
-        (ObjectType type, byte[] content) = ReadObject(id);
-        if (type != ObjectType.Blob)
-            throw new InvalidOperationException($"Object {id} is not a blob (found {type}).");
-
-        return BlobObject.FromBytes(content);
     }
 
     /// <summary>
@@ -1062,7 +1216,15 @@ public class Repository
             ? string.Join('\n', lines[messageStartLine..])
             : string.Empty;
 
-        return new CommitObject(treeId.Value, parents, author, committer, message);
+        var commit = new CommitObject(treeId.Value, parents, author, committer, message);
+
+        // Integrity check: the parsed commit must re-hash to the id it was stored under.
+        // A mismatch means on-disk corruption or a format the reader cannot round-trip.
+        if (commit.Id != expectedId)
+            throw new InvalidDataException(
+                $"Commit {expectedId} failed integrity verification (recomputed {commit.Id}).");
+
+        return commit;
     }
 
     /// <summary>
@@ -1115,8 +1277,10 @@ public class Repository
 
     private Signature GetDefaultSignature()
     {
-        string name = Config.GetUserName() ?? "Unknown";
-        string email = Config.GetUserEmail() ?? "unknown@unknown";
+        string? configuredName = Config.GetUserName();
+        string? configuredEmail = Config.GetUserEmail();
+        string name = string.IsNullOrWhiteSpace(configuredName) ? "Unknown" : configuredName.Trim();
+        string email = string.IsNullOrWhiteSpace(configuredEmail) ? "unknown@unknown" : configuredEmail.Trim();
         return new Signature(name, email, DateTimeOffset.Now);
     }
 

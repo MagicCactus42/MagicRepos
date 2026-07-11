@@ -26,51 +26,10 @@ public class WorkingTree
     }
 
     /// <summary>
-    /// Reads the full contents of a file given its path relative to the working directory.
-    /// </summary>
-    public byte[] ReadFile(string relativePath)
-    {
-        var fullPath = GetFullPath(relativePath);
-        return File.ReadAllBytes(fullPath);
-    }
-
-    /// <summary>
-    /// Gets the last modification time of a file as Unix-style seconds and nanoseconds.
-    /// </summary>
-    public (long seconds, int nanoseconds) GetModifiedTime(string relativePath)
-    {
-        var fullPath = GetFullPath(relativePath);
-        var lastWrite = File.GetLastWriteTimeUtc(fullPath);
-        var epoch = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
-        var elapsed = lastWrite - epoch;
-        var totalSeconds = (long)elapsed.TotalSeconds;
-        var fractionalTicks = elapsed.Ticks - totalSeconds * TimeSpan.TicksPerSecond;
-        var nanoseconds = (int)(fractionalTicks * 100); // 1 tick = 100 ns
-        return (totalSeconds, nanoseconds);
-    }
-
-    /// <summary>
-    /// Gets the size of a file in bytes.
-    /// </summary>
-    public int GetFileSize(string relativePath)
-    {
-        var fullPath = GetFullPath(relativePath);
-        var info = new FileInfo(fullPath);
-        return (int)info.Length;
-    }
-
-    /// <summary>
-    /// Checks whether a file exists at the given relative path.
-    /// </summary>
-    public bool FileExists(string relativePath)
-    {
-        var fullPath = GetFullPath(relativePath);
-        return File.Exists(fullPath);
-    }
-
-    /// <summary>
     /// Recursively enumerates a directory, collecting non-ignored file paths.
-    /// Directories that are ignored are pruned entirely.
+    /// Directories that are ignored are pruned entirely. Symlinks (reparse points) are
+    /// skipped so directory-symlink cycles cannot expand into an unbounded / duplicated
+    /// listing, and a symlink pointing at the repository root cannot expose internals.
     /// </summary>
     private void EnumerateDirectory(string directory, List<string> results)
     {
@@ -79,12 +38,9 @@ public class WorkingTree
         {
             entries = Directory.GetFileSystemEntries(directory);
         }
-        catch (UnauthorizedAccessException)
-        {
-            return;
-        }
         catch (DirectoryNotFoundException)
         {
+            // The directory disappeared during enumeration (benign race).
             return;
         }
 
@@ -92,6 +48,9 @@ public class WorkingTree
 
         foreach (var entry in entries)
         {
+            if (IsSymlink(entry))
+                continue;
+
             var relativePath = ToRelativePath(entry);
             var isDir = Directory.Exists(entry);
 
@@ -110,20 +69,27 @@ public class WorkingTree
     }
 
     /// <summary>
+    /// Returns <see langword="true"/> if the entry is a symbolic link / reparse point.
+    /// </summary>
+    private static bool IsSymlink(string path)
+    {
+        try
+        {
+            return File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // If we cannot even read the attributes, do not traverse it.
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Converts an absolute path to a path relative to the working directory, using forward slashes.
     /// </summary>
     private string ToRelativePath(string absolutePath)
     {
         var relative = Path.GetRelativePath(_workingDir, absolutePath);
         return relative.Replace('\\', '/');
-    }
-
-    /// <summary>
-    /// Resolves a relative path (with forward slashes) to an absolute filesystem path.
-    /// </summary>
-    private string GetFullPath(string relativePath)
-    {
-        var normalized = relativePath.Replace('/', Path.DirectorySeparatorChar);
-        return Path.Combine(_workingDir, normalized);
     }
 }
