@@ -74,9 +74,17 @@ public class RemoteClient : IDisposable
     private const byte MsgOk = 8;
     private const byte MsgError = 9;
 
+    /// <summary>
+    /// Upper bound on a single message payload from the remote (64 MiB), matching the
+    /// server. Guards against a malicious/buggy remote advertising a huge length and
+    /// forcing an out-of-memory allocation on the client.
+    /// </summary>
+    private const int MaxMessageLength = 64 * 1024 * 1024;
+
     private Process? _process;
     private Stream? _stdin;
     private Stream? _stdout;
+    private Task<string>? _stderrReadTask;
 
     /// <summary>
     /// Connects to the remote host by spawning an SSH process that invokes the
@@ -98,30 +106,35 @@ public class RemoteClient : IDisposable
         _process.Start();
         _stdin = _process.StandardInput.BaseStream;
         _stdout = _process.StandardOutput.BaseStream;
+
+        // Drain stderr on a background task. If we did not, a remote that writes more than
+        // the OS pipe buffer to stderr (banners, diagnostics) would block, deadlocking the
+        // session; capturing it also lets us surface the real failure reason to the user.
+        _stderrReadTask = _process.StandardError.ReadToEndAsync();
     }
 
     /// <summary>
-    /// Pushes local objects and branch refs to the remote.
-    /// Sends all objects reachable from local branch tips that the remote does not
-    /// already have, then updates the remote's refs.
+    /// Returns a suffix describing the remote's stderr output, if any is available, for
+    /// inclusion in error messages.
     /// </summary>
-    public async Task PushAsync(ObjectStore localStore, RefStore localRefs, string remoteName, CancellationToken ct = default)
+    private string StderrSuffix()
     {
-        // 1. Send NegotiateRequest("push\0username\0repoName")
-        //    The remoteName is used to look up the URL, but we need the URL to
-        //    have been parsed before Connect(). The username/repoName come from
-        //    the RemoteUrl used at Connect time. We re-derive them from the
-        //    connection info embedded in the negotiate request sent at Connect.
-        //    Actually, the caller should pass the RemoteUrl or we parse it from config.
-        //    For simplicity, we accept the remote URL parts via a helper overload.
-        //    This method is called after Connect(), so we require the URL fields to
-        //    have been provided separately.
-        throw new InvalidOperationException(
-            "Use the overload PushAsync(ObjectStore, RefStore, RemoteUrl, CancellationToken) instead.");
+        // Give the process a brief moment to flush stderr and exit after stdout closed.
+        _process?.WaitForExit(500);
+
+        if (_stderrReadTask is not null && _stderrReadTask.IsCompletedSuccessfully)
+        {
+            string err = _stderrReadTask.Result.Trim();
+            if (err.Length > 0)
+                return $" Remote error output: {err}";
+        }
+
+        return string.Empty;
     }
 
     /// <summary>
     /// Pushes local objects and branch refs to the remote.
+    /// Sends all objects reachable from local branch tips, then updates the remote's refs.
     /// </summary>
     public async Task PushAsync(ObjectStore localStore, RefStore localRefs, RemoteUrl remoteUrl, CancellationToken ct = default)
     {
@@ -154,16 +167,10 @@ public class RemoteClient : IDisposable
         // 4. Determine which local branches to push (all refs/heads/*)
         IReadOnlyList<string> localBranches = localRefs.ListBranches();
 
-        // Build set of remote object IDs so we can skip objects the remote already has
-        var remoteObjectIds = new HashSet<ObjectId>();
-        foreach (ObjectId remoteId in remoteRefs.Values)
-        {
-            // We cannot walk remote objects (we don't have them locally necessarily),
-            // but we can skip sending objects whose commit tips are already known.
-            remoteObjectIds.Add(remoteId);
-        }
-
-        // 5. Collect all objects reachable from local branch tips
+        // 5. Collect all objects reachable from local branch tips.
+        // Note: every reachable object is re-sent; the server skips ones it already has
+        // (ObjectStore.Write is a no-op when the object exists), so this is correct but
+        // not bandwidth-optimal for large histories.
         var allObjects = new HashSet<ObjectId>();
         var refUpdates = new List<(string RefName, ObjectId NewId)>();
 
@@ -210,16 +217,6 @@ public class RemoteClient : IDisposable
             throw new InvalidOperationException($"Push failed: {Encoding.UTF8.GetString(resultPayload)}");
         if (resultType != MsgOk)
             throw new InvalidOperationException($"Unexpected response after push: message type {resultType}");
-    }
-
-    /// <summary>
-    /// Pulls objects from the remote and updates local remote-tracking refs.
-    /// Returns a dictionary mapping remote ref names to their object IDs.
-    /// </summary>
-    public async Task<Dictionary<string, ObjectId>> PullAsync(ObjectStore localStore, RefStore localRefs, string remoteName, CancellationToken ct = default)
-    {
-        throw new InvalidOperationException(
-            "Use the overload PullAsync(ObjectStore, RefStore, RemoteUrl, string, CancellationToken) instead.");
     }
 
     /// <summary>
@@ -286,15 +283,22 @@ public class RemoteClient : IDisposable
 
             if (msgType == MsgPackData)
             {
-                if (msgPayload.Length > ObjectId.HexLength)
-                {
-                    string idHex = Encoding.ASCII.GetString(msgPayload, 0, ObjectId.HexLength);
-                    ObjectId objectId = ObjectId.Parse(idHex);
-                    byte[] compressedData = new byte[msgPayload.Length - ObjectId.HexLength];
-                    Buffer.BlockCopy(msgPayload, ObjectId.HexLength, compressedData, 0, compressedData.Length);
+                if (msgPayload.Length <= ObjectId.HexLength)
+                    throw new InvalidOperationException("Malformed pack data received from remote.");
 
-                    localStore.Write(objectId, compressedData);
-                }
+                string idHex = Encoding.ASCII.GetString(msgPayload, 0, ObjectId.HexLength);
+                if (!ObjectId.TryParse(idHex, out ObjectId objectId))
+                    throw new InvalidOperationException("Malformed object id received from remote.");
+
+                byte[] compressedData = new byte[msgPayload.Length - ObjectId.HexLength];
+                Buffer.BlockCopy(msgPayload, ObjectId.HexLength, compressedData, 0, compressedData.Length);
+
+                // Verify the object hashes to its claimed id before trusting it, so a
+                // malicious remote cannot feed us corrupt content under a good hash.
+                if (!ObjectSerializer.TryVerify(compressedData, objectId))
+                    throw new InvalidOperationException($"Object {idHex} from remote failed integrity verification.");
+
+                localStore.Write(objectId, compressedData);
             }
             else if (msgType == MsgPackComplete)
             {
@@ -392,29 +396,31 @@ public class RemoteClient : IDisposable
     /// </summary>
     public void Dispose()
     {
-        _stdin?.Dispose();
-        _stdout?.Dispose();
+        // Close stdin first so ssh sees EOF and can exit on its own; only force-kill if it
+        // does not exit promptly. This avoids leaving the remote command half-run.
+        try { _stdin?.Dispose(); }
+        catch { /* ignore */ }
 
         if (_process is not null)
         {
-            if (!_process.HasExited)
+            try
             {
-                try
-                {
+                if (!_process.WaitForExit(2000) && !_process.HasExited)
                     _process.Kill();
-                }
-                catch
-                {
-                    // Best-effort cleanup; ignore errors during disposal
-                }
             }
-
-            _process.Dispose();
+            catch
+            {
+                // Best-effort cleanup; ignore errors during disposal
+            }
         }
+
+        try { _stdout?.Dispose(); }
+        catch { /* ignore */ }
 
         _stdin = null;
         _stdout = null;
         _process = null;
+        _stderrReadTask = null;
     }
 
     // ──────────────────────────── Object graph walk ────────────────────────────
@@ -549,8 +555,21 @@ public class RemoteClient : IDisposable
         EnsureConnected();
 
         byte[] lengthBuf = new byte[4];
-        await ReadExactAsync(_stdout!, lengthBuf, ct);
-        int length = (lengthBuf[0] << 24) | (lengthBuf[1] << 16) | (lengthBuf[2] << 8) | lengthBuf[3];
+        try
+        {
+            await ReadExactAsync(_stdout!, lengthBuf, ct);
+        }
+        catch (EndOfStreamException)
+        {
+            throw new IOException($"Connection to remote closed unexpectedly.{StderrSuffix()}");
+        }
+
+        // Read as unsigned to reject negative lengths, and cap the size to avoid a
+        // remote-triggered out-of-memory allocation.
+        uint length = ((uint)lengthBuf[0] << 24) | ((uint)lengthBuf[1] << 16)
+            | ((uint)lengthBuf[2] << 8) | lengthBuf[3];
+        if (length > MaxMessageLength)
+            throw new IOException($"Remote sent an oversized message ({length} bytes).");
 
         byte[] typeBuf = new byte[1];
         await ReadExactAsync(_stdout!, typeBuf, ct);
