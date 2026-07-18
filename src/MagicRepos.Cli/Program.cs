@@ -26,6 +26,7 @@ initCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(initCommand);
@@ -59,11 +60,13 @@ addCommand.SetAction(parseResult =>
         else
         {
             AnsiConsole.MarkupLine("[red]Error: Please specify a file path or use -A/--all to stage all changes[/]");
+            Environment.ExitCode = 1;
         }
     }
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(addCommand);
@@ -98,6 +101,7 @@ commitCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(commitCommand);
@@ -167,6 +171,7 @@ statusCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(statusCommand);
@@ -206,6 +211,7 @@ logCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(logCommand);
@@ -269,6 +275,7 @@ diffCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(diffCommand);
@@ -331,6 +338,7 @@ branchCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(branchCommand);
@@ -339,20 +347,25 @@ rootCommand.Subcommands.Add(branchCommand);
 
 var checkoutCommand = new Command("checkout") { Description = "Switch branches" };
 var checkoutBranchArg = new Argument<string>("branch");
+var checkoutForceOption = new Option<bool>("-f") { Description = "Discard local changes when switching" };
+checkoutForceOption.Aliases.Add("--force");
 checkoutCommand.Arguments.Add(checkoutBranchArg);
+checkoutCommand.Options.Add(checkoutForceOption);
 checkoutCommand.SetAction(parseResult =>
 {
     try
     {
         var branch = parseResult.GetValue(checkoutBranchArg)!;
+        var force = parseResult.GetValue(checkoutForceOption);
 
         var repo = Repository.Open(Directory.GetCurrentDirectory());
-        repo.CheckoutBranch(branch);
+        repo.CheckoutBranch(branch, force);
         AnsiConsole.MarkupLine($"Switched to branch [cyan]{Markup.Escape(branch)}[/]");
     }
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(checkoutCommand);
@@ -375,10 +388,15 @@ resetCommand.SetAction(parseResult =>
         var target = parseResult.GetValue(resetTargetArg)!;
         var hard = parseResult.GetValue(resetHardOption);
         var soft = parseResult.GetValue(resetSoftOption);
+        var mixed = parseResult.GetValue(resetMixedOption);
+
+        // --hard / --soft / --mixed are mutually exclusive.
+        if ((hard ? 1 : 0) + (soft ? 1 : 0) + (mixed ? 1 : 0) > 1)
+            throw new InvalidOperationException("Options --hard, --soft, and --mixed are mutually exclusive.");
 
         var repo = Repository.Open(Directory.GetCurrentDirectory());
 
-        var mode = ResetMode.Mixed; // default
+        var mode = ResetMode.Mixed; // default (also selected explicitly by --mixed)
         if (hard) mode = ResetMode.Hard;
         else if (soft) mode = ResetMode.Soft;
 
@@ -388,6 +406,7 @@ resetCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(resetCommand);
@@ -416,6 +435,7 @@ remoteAddCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 remoteCommand.Subcommands.Add(remoteAddCommand);
@@ -442,6 +462,7 @@ remoteListCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 remoteCommand.Subcommands.Add(remoteListCommand);
@@ -475,6 +496,7 @@ pushCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(pushCommand);
@@ -501,28 +523,57 @@ pullCommand.SetAction(parseResult =>
         client.Connect(remoteUrl);
         var remoteRefs = client.PullAsync(repo.ObjectStore, repo.Refs, remoteUrl, remoteName).GetAwaiter().GetResult();
 
-        // Fast-forward local branches to match remote-tracking refs
+        // Integrate remote-tracking refs into local branches. Only fast-forwards are
+        // performed; a diverged branch is left untouched so local commits are never lost.
         var currentBranch = repo.Refs.GetCurrentBranchName();
         foreach (var (refName, objectId) in remoteRefs)
         {
-            if (!refName.StartsWith("refs/heads/")) continue;
+            if (!refName.StartsWith("refs/heads/", StringComparison.Ordinal)) continue;
             var branch = refName["refs/heads/".Length..];
+            var localId = repo.Refs.ResolveBranch(branch);
+
             if (branch == currentBranch)
             {
-                // Fast-forward current branch and update working tree
+                if (localId is not null && localId.Value == objectId)
+                {
+                    AnsiConsole.MarkupLine($"[grey]Branch {Markup.Escape(branch)} is already up to date.[/]");
+                    continue;
+                }
+
+                // Only fast-forward: the remote tip must descend from the local tip.
+                if (localId is not null && !repo.IsAncestor(localId.Value, objectId))
+                {
+                    AnsiConsole.MarkupLine(
+                        $"[red]Branch {Markup.Escape(branch)} has diverged from the remote; " +
+                        "not fast-forwarding. Merge/rebase manually.[/]");
+                    Environment.ExitCode = 1;
+                    continue;
+                }
+
+                // Refuse to overwrite uncommitted work in the working tree.
+                if (!repo.IsWorkingTreeClean())
+                {
+                    AnsiConsole.MarkupLine(
+                        $"[red]Cannot update {Markup.Escape(branch)}: you have uncommitted changes. " +
+                        "Commit or discard them first.[/]");
+                    Environment.ExitCode = 1;
+                    continue;
+                }
+
                 repo.Refs.CreateBranch(branch, objectId);
                 repo.Reset("HEAD", ResetMode.Hard);
                 AnsiConsole.MarkupLine($"[green]Updated branch {Markup.Escape(branch)} (fast-forward)[/]");
             }
-            else
+            else if (localId is null)
             {
-                // Update non-current local branch if it exists
-                var localId = repo.Refs.ResolveBranch(branch);
-                if (localId is null)
-                {
-                    repo.Refs.CreateBranch(branch, objectId);
-                    AnsiConsole.MarkupLine($"[green]Created branch {Markup.Escape(branch)}[/]");
-                }
+                repo.Refs.CreateBranch(branch, objectId);
+                AnsiConsole.MarkupLine($"[green]Created branch {Markup.Escape(branch)}[/]");
+            }
+            else if (localId.Value != objectId && repo.IsAncestor(localId.Value, objectId))
+            {
+                // Non-current branch that can fast-forward — advance its ref only.
+                repo.Refs.CreateBranch(branch, objectId);
+                AnsiConsole.MarkupLine($"[green]Updated branch {Markup.Escape(branch)} (fast-forward)[/]");
             }
         }
 
@@ -531,6 +582,7 @@ pullCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(pullCommand);
@@ -556,6 +608,7 @@ cloneCommand.SetAction(parseResult =>
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
     }
 });
 rootCommand.Subcommands.Add(cloneCommand);
@@ -610,7 +663,9 @@ rootCommand.Subcommands.Add(prCommand);
 
 // ─── Run ───────────────────────────────────────────────────────────────────────
 
-return rootCommand.Parse(args).Invoke();
+// Honour an exit code set by an action's error handler even when Invoke() itself returns 0.
+int invokeResult = rootCommand.Parse(args).Invoke();
+return invokeResult != 0 ? invokeResult : Environment.ExitCode;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
